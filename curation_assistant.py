@@ -202,7 +202,7 @@ def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
             docs.append(Document(page_content=text, metadata={"source": name, "sheet": sheet}))
         return docs
     except Exception as e:
-        st.error(f\"Failed to parse Excel '{name}': {e}\")
+        st.error(f"Failed to parse Excel '{name}': {e}")
         return []
 
 def load_files_to_documents(uploaded_files) -> Tuple[List[Document], List[Image.Image]]:
@@ -210,22 +210,22 @@ def load_files_to_documents(uploaded_files) -> Tuple[List[Document], List[Image.
     all_figs: List[Image.Image] = []
     for uf in uploaded_files:
         suffix = Path(uf.name).suffix.lower()
-        if suffix in [\".txt\", \".md\", \".csv\"]:
+        if suffix in [".txt", ".md", ".csv"]:
             all_docs.extend(_read_txt(uf, uf.name))
-        elif suffix == \".pdf\":
+        elif suffix == ".pdf":
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(uf.read()); tmp.flush()
                 docs = _read_pdf_to_docs(Path(tmp.name), uf.name)
                 ocr_docs, figs = _extract_pdf_images(Path(tmp.name), uf.name)
             all_docs.extend(docs); all_docs.extend(ocr_docs); all_figs.extend(figs)
-        elif suffix == \".docx\":
+        elif suffix == ".docx":
             all_docs.extend(_read_docx(uf, uf.name))
-        elif suffix == \".doc\":
+        elif suffix == ".doc":
             all_docs.extend(_read_doc(uf, uf.name))
-        elif suffix in [\".xlsx\", \".xlsm\", \".xls\"]:
+        elif suffix in [".xlsx", ".xlsm", ".xls"]:
             all_docs.extend(_read_xlsx(uf, uf.name))
         else:
-            st.warning(f\"Unsupported file type: {uf.name}\")
+            st.warning(f"Unsupported file type: {uf.name}")
     return all_docs, all_figs
 
 # =================================
@@ -242,18 +242,18 @@ def _read_csv_any(file_obj):
     try:
         df = pd.read_csv(
             file_obj,
-            sep=None, engine=\"python\", dtype=str,
+            sep=None, engine="python", dtype=str,
             na_filter=True, low_memory=False,
-            on_bad_lines=\"skip\"
+            on_bad_lines="skip"
         )
         return df
     except Exception:
         _rewind(file_obj)
         return pd.read_csv(
             file_obj,
-            sep=\"\\t\", dtype=str,
+            sep="\t", dtype=str,
             na_filter=True, low_memory=False,
-            on_bad_lines=\"skip\"
+            on_bad_lines="skip"
         )
 
 def _read_excel_any(file_obj):
@@ -264,38 +264,38 @@ def _read_excel_any(file_obj):
         frames = [xls.parse(s, dtype=str) for s in xls.sheet_names]
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     except Exception as e:
-        st.error(f\"Excel read failed: {e}\")
+        st.error(f"Excel read failed: {e}")
         return pd.DataFrame()
 
 def _read_any_table(file_obj):
     suffix = Path(file_obj.name).suffix.lower()
-    if suffix in {\".csv\", \".tsv\", \".txt\"}:
+    if suffix in {".csv", ".tsv", ".txt"}:
         return _read_csv_any(file_obj)
-    elif suffix in {\".xlsx\", \".xls\"}:
+    elif suffix in {".xlsx", ".xls"}:
         return _read_excel_any(file_obj)
     else:
-        st.warning(f\"Unsupported supplement file type: {file_obj.name}\")
+        st.warning(f"Unsupported supplement file type: {file_obj.name}")
         return pd.DataFrame()
 
 # =================================
 # HELPERS — FREQUENCY LOGIC
 # =================================
 def _standardize_cols(cols):
-    return [str(c).strip().lower().replace(\" \", \"_\") for c in cols]
+    return [str(c).strip().lower().replace(" ", "_") for c in cols]
 
 def _find_col(cols, candidates):
     for c in cols:
         for cand in candidates:
-            if c == cand or c.endswith(f\"_{cand}\") or cand in c:
+            if c == cand or c.endswith(f"_{cand}") or cand in c:
                 return c
     return None
 
 def infer_total_samples(named_frames, sample_cands=None) -> int:
-    \"\"\"Infer denominator from any uploaded table that has a sample id column.\"\"\"
+    """Infer denominator from any uploaded table that has a sample id column."""
     if sample_cands is None:
         sample_cands = [
-            \"tumor_sample_barcode\", \"sample_id\", \"sample\", \"biosample\",
-            \"patient\", \"subject\", \"case_id\", \"case\", \"participant_id\"
+            "tumor_sample_barcode", "sample_id", "sample", "biosample",
+            "patient", "subject", "case_id", "case", "participant_id"
         ]
     uniq = set()
     for _, raw_df in named_frames:
@@ -310,58 +310,58 @@ def infer_total_samples(named_frames, sample_cands=None) -> int:
     return len(uniq)
 
 def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = None):
-    \"\"\"
+    """
     df can be:
       A) long format: (gene, sample_id)
       B) aggregated:  (gene, count)
     Returns (freq_df, denominator_used)
-    \"\"\"
+    """
     if df is None or df.empty:
-        return pd.DataFrame(columns=[\"gene\", \"n_samples\", \"percentage\"]), 0
+        return pd.DataFrame(columns=["gene", "n_samples", "percentage"]), 0
 
     df = df.copy()
     df.columns = _standardize_cols(df.columns)
 
-    gene_col   = _find_col(df.columns, [\"gene\", \"symbol\", \"gene_symbol\", \"hgnc\", \"ensembl\", \"gene_id\", \"hugo_symbol\")
+    gene_col   = _find_col(df.columns, ["gene", "symbol", "gene_symbol", "hgnc", "ensembl", "gene_id", "hugo_symbol"])
     sample_col = _find_col(df.columns, [
-        \"sample\", \"sample_id\", \"tumor_sample_barcode\", \"biosample\",
-        \"patient\", \"subject\", \"case_id\", \"case\", \"participant_id\"
+        "sample", "sample_id", "tumor_sample_barcode", "biosample",
+        "patient", "subject", "case_id", "case", "participant_id"
     ])
-    count_col  = _find_col(df.columns, [\"count\", \"n\", \"num\", \"samples\"])
+    count_col  = _find_col(df.columns, ["count", "n", "num", "samples"])
 
     if not gene_col:
-        raise ValueError(\"Could not detect a gene column (e.g., 'gene', 'symbol', 'Hugo_Symbol').\")
+        raise ValueError("Could not detect a gene column (e.g., 'gene', 'symbol', 'Hugo_Symbol').")
 
     if sample_col and (count_col is None or count_col not in df.columns):
         sub = df[[gene_col, sample_col]].dropna()
         if sub.empty:
-            return pd.DataFrame(columns=[\"gene\", \"n_samples\", \"percentage\"]), 0
+            return pd.DataFrame(columns=["gene", "n_samples", "percentage"]), 0
         sub[gene_col] = sub[gene_col].astype(str)
         sub[sample_col] = sub[sample_col].astype(str)
-        grp = sub.groupby(gene_col)[sample_col].nunique().reset_index(name=\"n_samples\")
+        grp = sub.groupby(gene_col)[sample_col].nunique().reset_index(name="n_samples")
         denom = int(total_samples) if total_samples else int(sub[sample_col].nunique())
 
     elif count_col in df.columns:
         sub = df[[gene_col, count_col]].dropna()
         if sub.empty:
-            return pd.DataFrame(columns=[\"gene\", \"n_samples\", \"percentage\"]), 0
+            return pd.DataFrame(columns=["gene", "n_samples", "percentage"]), 0
         sub[gene_col] = sub[gene_col].astype(str)
-        sub[count_col] = pd.to_numeric(sub[count_col], errors=\"coerce\").fillna(0).astype(int)
-        grp = sub.groupby(gene_col)[count_col].sum().reset_index(name=\"n_samples\")
-        denom = int(total_samples) if total_samples else int(grp[\"n_samples\"].sum())
+        sub[count_col] = pd.to_numeric(sub[count_col], errors="coerce").fillna(0).astype(int)
+        grp = sub.groupby(gene_col)[count_col].sum().reset_index(name="n_samples")
+        denom = int(total_samples) if total_samples else int(grp["n_samples"].sum())
 
     else:
         raise ValueError(
-            \"Could not detect suitable columns. Expected either (gene + sample_id) or (gene + count). \"
-            f\"Columns seen: {list(df.columns)[:12]} ...\"
+            "Could not detect suitable columns. Expected either (gene + sample_id) or (gene + count). "
+            f"Columns seen: {list(df.columns)[:12]} ..."
         )
 
-    grp = grp.sort_values(\"n_samples\", ascending=False)
+    grp = grp.sort_values("n_samples", ascending=False)
     denom = max(int(denom), 1)
-    grp[\"percentage\"] = (grp[\"n_samples\"] / denom) * 100.0
-    grp[\"percentage\"] = grp[\"percentage\"].round(6)
-    if grp.columns[0] != \"gene\":
-        grp = grp.rename(columns={grp.columns[0]: \"gene\"})
+    grp["percentage"] = (grp["n_samples"] / denom) * 100.0
+    grp["percentage"] = grp["percentage"].round(6)
+    if grp.columns[0] != "gene":
+        grp = grp.rename(columns={grp.columns[0]: "gene"})
     return grp, denom
 
 # =================================
@@ -371,7 +371,7 @@ def build_index(docs: List[Document]) -> Tuple[Chroma, OpenAIEmbeddings, List[Do
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     splits = splitter.split_documents(docs)
     if len(splits) == 0:
-        raise ValueError(\"No text extracted from the uploaded files.\")
+        raise ValueError("No text extracted from the uploaded files.")
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 
     def _construct():
@@ -387,7 +387,7 @@ def build_index(docs: List[Document]) -> Tuple[Chroma, OpenAIEmbeddings, List[Do
     except RuntimeError as e:
         # If an old SQLite-backed index or schema conflict exists, wipe and rebuild with DuckDB
         msg = str(e).lower()
-        if any(k in msg for k in [\"unsupported version of sqlite3\", \"schema\", \"duckdb\", \"cannot open\"]):
+        if any(k in msg for k in ["unsupported version of sqlite3", "schema", "duckdb", "cannot open"]):
             try:
                 import shutil
                 if os.path.isdir(PERSIST_DIR):
