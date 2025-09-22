@@ -12,9 +12,26 @@ Quickstart
 2) pip install -r requirements.txt
 3) export OPENAI_API_KEY=sk-...
 4) streamlit run new_app.py
+
+Patched Streamlit Curation Assistant Tool
+- Fixes Chroma "unsupported sqlite3" by monkeypatching sqlite3 via pysqlite3-binary
+- Still uses Chroma with DuckDB+Parquet (no SQLite storage)
 """
 
 from __future__ import annotations
+
+# --- HOTFIX for old system sqlite3 -------------------------------------------
+# Must run BEFORE importing anything that imports sqlite3 (e.g., chromadb/langchain Chroma)
+try:
+    import sys
+    __import__("pysqlite3")
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    # If pysqlite3-binary isn't installed, we'll continue; Chroma may still error.
+    # Install dependency from requirements_sqlfix.txt to enable this patch.
+    pass
+# ----------------------------------------------------------------------------
+
 import io
 import os
 import re
