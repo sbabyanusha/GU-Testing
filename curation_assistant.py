@@ -199,7 +199,7 @@ def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
             text_rows = ["\t".join(df.columns.astype(str))]
             text_rows += ["\t".join(map(str, row)) for row in df.itertuples(index=False, name=None)]
             text = "\n".join(text_rows)
-            docs.append(Document(page_content=text, metadata={\"source\": name, \"sheet\": sheet}))
+            docs.append(Document(page_content=text, metadata={"source": name, "sheet": sheet}))
         return docs
     except Exception as e:
         st.error(f\"Failed to parse Excel '{name}': {e}\")
