@@ -196,9 +196,9 @@ def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
         xl = pd.ExcelFile(file)
         for sheet in xl.sheet_names:
             df = xl.parse(sheet).astype(str)
-            text_rows = [\"\\t\".join(df.columns.astype(str))]
-            text_rows += [\"\\t\".join(map(str, row)) for row in df.itertuples(index=False, name=None)]
-            text = \"\\n\".join(text_rows)
+            text_rows = ["\t".join(df.columns.astype(str))]
+            text_rows += ["\t".join(map(str, row)) for row in df.itertuples(index=False, name=None)]
+            text = "\n".join(text_rows)
             docs.append(Document(page_content=text, metadata={\"source\": name, \"sheet\": sheet}))
         return docs
     except Exception as e:
