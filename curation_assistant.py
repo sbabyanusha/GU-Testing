@@ -13,22 +13,22 @@ Quickstart
 3) export OPENAI_API_KEY=sk-...
 4) streamlit run new_app.py
 
-Patched Streamlit Curation Assistant Tool
-- Fixes Chroma "unsupported sqlite3" by monkeypatching sqlite3 via pysqlite3-binary
-- Still uses Chroma with DuckDB+Parquet (no SQLite storage)
+Streamlit Curation Assistant Tool (Chroma v2 client)
+
+- Uses Chroma's new PersistentClient API (no deprecated Settings/Client)
+- Stores locally with DuckDB+Parquet (no SQLite storage)
+- Includes optional sqlite hotfix via pysqlite3-binary for import-time checks
 """
 
 from __future__ import annotations
 
-# --- HOTFIX for old system sqlite3 -------------------------------------------
-# Must run BEFORE importing anything that imports sqlite3 (e.g., chromadb/langchain Chroma)
+# ---- Optional sqlite hotfix (helps older systems) ----------------------------
+# Ensure this runs *before* importing chromadb or anything that imports sqlite3
 try:
     import sys
     __import__("pysqlite3")
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except Exception:
-    # If pysqlite3-binary isn't installed, we'll continue; Chroma may still error.
-    # Install dependency from requirements_sqlfix.txt to enable this patch.
     pass
 # ----------------------------------------------------------------------------
 
@@ -51,6 +51,9 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+# Chroma new client
+import chromadb
+
 # Loaders
 from langchain_community.document_loaders import PyPDFLoader
 import docx
@@ -69,14 +72,6 @@ try:
 except Exception:
     _HAS_TEXTRACT = False
 
-# --- Chroma config: force DuckDB+Parquet to avoid SQLite requirement ---
-from chromadb.config import Settings
-PERSIST_DIR = "./chroma_index"
-CHROMA_SETTINGS = Settings(
-    chroma_db_impl="duckdb+parquet",
-    persist_directory=PERSIST_DIR,
-)
-
 # =================================
 # CONFIG & CONSTANTS
 # =================================
@@ -86,6 +81,9 @@ CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 TOP_K = 5
 MMR_LAMBDA = 0.5
+
+PERSIST_DIR = "./chroma_index"           # directory for DuckDB+Parquet files
+COLLECTION_NAME = "curation_assistant"   # name in Chroma
 
 EMBED_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o-mini"
@@ -382,8 +380,12 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
     return grp, denom
 
 # =================================
-# BUILD / LOAD INDEX (Chroma, DuckDB backend)
+# BUILD / LOAD INDEX (Chroma PersistentClient)
 # =================================
+def _chroma_client():
+    # DuckDB+Parquet local persistent store
+    return chromadb.PersistentClient(path=PERSIST_DIR)
+
 def build_index(docs: List[Document]) -> Tuple[Chroma, OpenAIEmbeddings, List[Document]]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     splits = splitter.split_documents(docs)
@@ -391,30 +393,13 @@ def build_index(docs: List[Document]) -> Tuple[Chroma, OpenAIEmbeddings, List[Do
         raise ValueError("No text extracted from the uploaded files.")
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 
-    def _construct():
-        return Chroma.from_documents(
-            splits,
-            embeddings,
-            persist_directory=PERSIST_DIR,
-            client_settings=CHROMA_SETTINGS,
-        )
-
-    try:
-        vectorstore = _construct()
-    except RuntimeError as e:
-        # If an old SQLite-backed index or schema conflict exists, wipe and rebuild with DuckDB
-        msg = str(e).lower()
-        if any(k in msg for k in ["unsupported version of sqlite3", "schema", "duckdb", "cannot open"]):
-            try:
-                import shutil
-                if os.path.isdir(PERSIST_DIR):
-                    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
-            except Exception:
-                pass
-            vectorstore = _construct()
-        else:
-            raise
-
+    client = _chroma_client()
+    vectorstore = Chroma.from_documents(
+        splits,
+        embeddings,
+        collection_name=COLLECTION_NAME,
+        client=client,
+    )
     try:
         vectorstore.persist()
     except Exception:
@@ -423,7 +408,12 @@ def build_index(docs: List[Document]) -> Tuple[Chroma, OpenAIEmbeddings, List[Do
 
 def load_existing_index() -> Tuple[Chroma, OpenAIEmbeddings]:
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-    vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings, client_settings=CHROMA_SETTINGS)
+    client = _chroma_client()
+    vs = Chroma(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+    )
     return vs, embeddings
 
 # =================================
