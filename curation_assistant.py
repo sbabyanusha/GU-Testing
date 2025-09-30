@@ -23,10 +23,6 @@ Curation Assistant (Streamlit)
 - Extract figures from PDFs and optionally OCR them
 - Compute simple per-gene frequencies from cBio-style tables
 
-Resilient storage:
-- Prefer Chroma (new Client API) for persistence when available
-- Fall back to FAISS (in-memory) automatically if Chroma/sqlite isn't usable
-
 This file is structured in small, clearly commented sections. Search for
 "SECTION:" markers to navigate.
 """
@@ -111,7 +107,7 @@ import mammoth  # .docx fallback
 # =============================================================================
 # SECTION: Streamlit setup & constants
 # =============================================================================
-st.set_page_config(page_title="🧬 Curation Assistant", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="🧬 Curation Assistant", layout="wide")
 
 # Tuning knobs
 CHUNK_SIZE = 1200
