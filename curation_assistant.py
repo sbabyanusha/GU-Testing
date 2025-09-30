@@ -23,8 +23,6 @@ Synopsis Tool
 - Extract figures from PDFs and optionally OCR them
 - Compute simple per-gene frequencies from cBio-style tables
 
-This file is structured in small, clearly commented sections. Search for
-"SECTION:" markers to navigate.
 """
 
 # =============================================================================
