@@ -1,5 +1,5 @@
 """
-Streamlit Curation Assistant Tool
+Synopsis Tool
 
 - Summarize & Q&A strictly from uploaded files (.pdf, .txt, .doc/.docx, .xlsx)
 - Extract figures/images from PDFs, and add to the RAG index
@@ -16,7 +16,7 @@ Quickstart
 
 from __future__ import annotations
 """
-Curation Assistant (Streamlit)
+Synopsis Tool
 -----------------------------
 - Ingest PDFs/DOCX/CSV/XLSX into a lightweight local RAG index
 - Summarize and Q&A strictly from uploaded documents
@@ -161,16 +161,16 @@ if not st.session_state.get("OPENAI_KEY_WARNED") and not st.secrets.get("OPENAI_
 # =============================================================================
 # SECTION: Diagnostics (left sidebar)
 # =============================================================================
-st.sidebar.markdown("### 🔧 Diagnostics")
-st.sidebar.write({
-    "python": sys.version,
-    "SQLITE_SHIM_OK": SQLITE_SHIM_OK,
-    "NP_SHIM_OK": NP_SHIM_OK,
-    "Chroma_imported": bool(Chroma),
-    "chroma_source": chroma_source,
-    "chromadb_client_ok": CLIENT is not None,
-    "chromadb_client_error": repr(client_error) if client_error else None,
-})
+#st.sidebar.markdown("### 🔧 Diagnostics")
+#st.sidebar.write({
+    #"python": sys.version,
+    #"SQLITE_SHIM_OK": SQLITE_SHIM_OK,
+    #"NP_SHIM_OK": NP_SHIM_OK,
+    #"Chroma_imported": bool(Chroma),
+    #"chroma_source": chroma_source,
+    #"chromadb_client_ok": CLIENT is not None,
+    #"chromadb_client_error": repr(client_error) if client_error else None,
+#})
 
 # =============================================================================
 # SECTION: File readers & utilities
