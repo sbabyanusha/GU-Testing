@@ -15,8 +15,49 @@ Quickstart
 """
 
 from __future__ import annotations
+"""
+Curation Assistant (Streamlit)
+-----------------------------
+- Ingest PDFs/DOCX/CSV/XLSX into a lightweight local RAG index
+- Summarize and Q&A strictly from uploaded documents
+- Extract figures from PDFs and optionally OCR them
+- Compute simple per-gene frequencies from cBio-style tables
+
+Resilient storage:
+- Prefer Chroma (new Client API) for persistence when available
+- Fall back to FAISS (in-memory) automatically if Chroma/sqlite isn't usable
+
+This file is structured in small, clearly commented sections. Search for
+"SECTION:" markers to navigate.
+"""
+
+# =============================================================================
+# SECTION: Compatibility shims (Python 3.13 sqlite, NumPy 2.x alias)
+# =============================================================================
+import sys
+# Provide a modern sqlite module for environments that ship an old stdlib sqlite
+# - Requires pysqlite3-binary in requirements. If import fails, we continue
+#   without persistence (FAISS fallback will still work).
+try:
+    import pysqlite3  # type: ignore
+    sys.modules["sqlite3"] = sys.modules["pysqlite3"]
+    SQLITE_SHIM_OK = True
+except Exception:
+    SQLITE_SHIM_OK = False
+
+# NumPy 2.x removes np.float_. Some upstream deps still reference it.
+try:
+    import numpy as np  # type: ignore
+    if not hasattr(np, "float_"):
+        np.float_ = np.float64  # noqa: NPY201
+    NP_SHIM_OK = True
+except Exception:
+    NP_SHIM_OK = False
+
+# =============================================================================
+# SECTION: Standard libs & third-party imports
+# =============================================================================
 import io
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -26,49 +67,65 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 
-# LangChain
+# LangChain + vectorstores
+# Try new "langchain_chroma" first; fall back to community path if not installed.
+Chroma = None
+CLIENT = None
+chroma_source = None
+client_error = None
+
+try:
+    from langchain_chroma import Chroma as _Chroma  # Newer LC integration
+    Chroma = _Chroma
+    chroma_source = "langchain_chroma"
+except Exception:
+    try:
+        from langchain_community.vectorstores import Chroma as _Chroma  # Legacy LC integration
+        Chroma = _Chroma
+        chroma_source = "langchain_community"
+    except Exception:
+        chroma_source = None
+
+# New Chroma Client API (migration-safe). If it fails, we can still run FAISS.
+try:
+    import chromadb  # noqa: F401
+    from chromadb import PersistentClient  # New API
+    CLIENT = PersistentClient(path="./chroma_index")
+except Exception as e:
+    client_error = e
+
+# FAISS fallback (always available to avoid hard failure)
+from langchain_community.vectorstores import FAISS
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# Loaders
+# Readers
 from langchain_community.document_loaders import PyPDFLoader
-import docx
-import mammoth
+import docx  # python-docx
+import mammoth  # .docx fallback
 
-# Optional deps
-try:
-    import pytesseract  # OCR
-    _HAS_TESS = True
-except Exception:
-    _HAS_TESS = False
+# =============================================================================
+# SECTION: Streamlit setup & constants
+# =============================================================================
+st.set_page_config(page_title="🧬 Curation Assistant", page_icon="🧠", layout="wide")
 
-try:
-    import textract  # legacy .doc
-    _HAS_TEXTRACT = True
-except Exception:
-    _HAS_TEXTRACT = False
-
-# =================================
-# CONFIG & CONSTANTS
-# =================================
-st.set_page_config(page_title="Synopsis + Gene Frequencies", page_icon="🧬", layout="wide")
-
+# Tuning knobs
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 TOP_K = 5
 MMR_LAMBDA = 0.5
-PERSIST_DIR = "./chroma_index"
 
+# Persistence & model params
+PERSIST_DIR = "./chroma_index"
+COLLECTION = "curation_assistant"
 EMBED_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o-mini"
 
-# =================================
-# STYLES
-# =================================
+# UI Styles
 st.markdown(
     """
 <style>
@@ -89,7 +146,7 @@ st.markdown(
 st.markdown(
     """
 <div class="hero">
-  <h2 style="margin:0">🧬 Curation Assistant Tool</h2>
+  <h2 style="margin:0">🧬 Curation Assistant</h2>
   <div style="margin-top:6px">
     Answers grounded strictly in your uploaded files.
     <span class="tag">Chroma</span><span class="tag">MMR</span><span class="tag">OCR</span><span class="tag">Frequencies</span>
@@ -99,20 +156,36 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =================================
-# ENV CHECK
-# =================================
-if not os.getenv("OPENAI_API_KEY"):
-    st.warning("OPENAI_API_KEY is not set — set it via environment or a .env file.")
+# Quick env hint
+if not st.session_state.get("OPENAI_KEY_WARNED") and not st.secrets.get("OPENAI_API_KEY", None) and not ("OPENAI_API_KEY" in st.session_state or "OPENAI_API_KEY" in st.session_state):
+    if not ("OPENAI_API_KEY" in st.session_state or "OPENAI_API_KEY" in st.secrets or "OPENAI_API_KEY" in st.session_state):
+        if not ("OPENAI_API_KEY" in st.session_state or "OPENAI_API_KEY" in st.secrets or "OPENAI_API_KEY" in st.session_state):
+            pass  # Avoid noisy warnings in some hosts
 
-# =================================
-# HELPERS — DOCUMENT INGESTION (RAG)
-# =================================
+# =============================================================================
+# SECTION: Diagnostics (left sidebar)
+# =============================================================================
+st.sidebar.markdown("### 🔧 Diagnostics")
+st.sidebar.write({
+    "python": sys.version,
+    "SQLITE_SHIM_OK": SQLITE_SHIM_OK,
+    "NP_SHIM_OK": NP_SHIM_OK,
+    "Chroma_imported": bool(Chroma),
+    "chroma_source": chroma_source,
+    "chromadb_client_ok": CLIENT is not None,
+    "chromadb_client_error": repr(client_error) if client_error else None,
+})
+
+# =============================================================================
+# SECTION: File readers & utilities
+# =============================================================================
 def _read_txt(file: io.BytesIO, name: str) -> List[Document]:
+    """Read plain text-like inputs (txt/md/csv treated as text)."""
     text = file.read().decode("utf-8", errors="ignore")
     return [Document(page_content=text, metadata={"source": name})]
 
 def _read_pdf_to_docs(tmp_path: Path, name: str) -> List[Document]:
+    """Load a PDF as LangChain Documents (page-wise)."""
     loader = PyPDFLoader(str(tmp_path))
     docs = loader.load()
     for d in docs:
@@ -120,7 +193,11 @@ def _read_pdf_to_docs(tmp_path: Path, name: str) -> List[Document]:
     return docs
 
 def _extract_pdf_images(tmp_path: Path, name: str) -> Tuple[List[Document], List[Image.Image]]:
-    """Extract images from a PDF with pypdf>=4. Add OCR+captions as RAG text docs when available."""
+    """
+    Extract embedded images from PDF pages.
+    - OCR image regions if pytesseract is available
+    - Return both OCR text (as docs) and PIL images for display
+    """
     from pypdf import PdfReader
     pil_images: List[Image.Image] = []
     ocr_docs: List[Document] = []
@@ -137,7 +214,8 @@ def _extract_pdf_images(tmp_path: Path, name: str) -> Tuple[List[Document], List
                     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                     pil_images.append(img)
                     ocr_text = ""
-                    if _HAS_TESS:
+                    if "pytesseract" in sys.modules:
+                        import pytesseract  # lazy import
                         try:
                             ocr_text = pytesseract.image_to_string(img)
                         except Exception:
@@ -160,6 +238,7 @@ def _extract_pdf_images(tmp_path: Path, name: str) -> Tuple[List[Document], List
     return ocr_docs, pil_images
 
 def _read_docx(file: io.BytesIO, name: str) -> List[Document]:
+    """Read .docx via python-docx; fallback to mammoth raw text."""
     try:
         f = io.BytesIO(file.read())
         doc = docx.Document(f)
@@ -172,19 +251,8 @@ def _read_docx(file: io.BytesIO, name: str) -> List[Document]:
         text = result.value or ""
         return [Document(page_content=text, metadata={"source": name})]
 
-def _read_doc(file: io.BytesIO, name: str) -> List[Document]:
-    if not _HAS_TEXTRACT:
-        st.warning(f"Skipping legacy .doc file '{name}': optional dependency 'textract' not available.")
-        return []
-    try:
-        data = file.read()
-        text = textract.process(io.BytesIO(data)).decode("utf-8", errors="ignore")
-        return [Document(page_content=text, metadata={"source": name})]
-    except Exception as e:
-        st.error(f"Failed to parse .doc '{name}': {e}")
-        return []
-
 def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
+    """Flatten Excel sheets into tab-delimited text documents."""
     docs: List[Document] = []
     try:
         xl = pd.ExcelFile(file)
@@ -192,14 +260,14 @@ def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
             df = xl.parse(sheet).astype(str)
             text_rows = ["\t".join(df.columns.astype(str))]
             text_rows += ["\t".join(map(str, row)) for row in df.itertuples(index=False, name=None)]
-            text = "\n".join(text_rows)
-            docs.append(Document(page_content=text, metadata={"source": name, "sheet": sheet}))
+            docs.append(Document(page_content="\n".join(text_rows), metadata={"source": name, "sheet": sheet}))
         return docs
     except Exception as e:
         st.error(f"Failed to parse Excel '{name}': {e}")
         return []
 
 def load_files_to_documents(uploaded_files) -> Tuple[List[Document], List[Image.Image]]:
+    """Route files by extension and collect both text docs and figures."""
     all_docs: List[Document] = []
     all_figs: List[Image.Image] = []
     for uf in uploaded_files:
@@ -214,41 +282,28 @@ def load_files_to_documents(uploaded_files) -> Tuple[List[Document], List[Image.
             all_docs.extend(docs); all_docs.extend(ocr_docs); all_figs.extend(figs)
         elif suffix == ".docx":
             all_docs.extend(_read_docx(uf, uf.name))
-        elif suffix == ".doc":
-            all_docs.extend(_read_doc(uf, uf.name))
         elif suffix in [".xlsx", ".xlsm", ".xls"]:
             all_docs.extend(_read_xlsx(uf, uf.name))
         else:
             st.warning(f"Unsupported file type: {uf.name}")
     return all_docs, all_figs
 
-# =================================
-# HELPERS — SUPPLEMENT READERS (robust)
-# =================================
+# =============================================================================
+# SECTION: Robust table readers (for gene frequency tab)
+# =============================================================================
 def _rewind(file_obj):
-    try:
-        file_obj.seek(0)
-    except Exception:
-        pass
+    try: file_obj.seek(0)
+    except Exception: pass
 
 def _read_csv_any(file_obj):
     _rewind(file_obj)
     try:
-        df = pd.read_csv(
-            file_obj,
-            sep=None, engine="python", dtype=str,
-            na_filter=True, low_memory=False,
-            on_bad_lines="skip"
-        )
-        return df
+        return pd.read_csv(file_obj, sep=None, engine="python", dtype=str,
+                           na_filter=True, low_memory=False, on_bad_lines="skip")
     except Exception:
         _rewind(file_obj)
-        return pd.read_csv(
-            file_obj,
-            sep="\t", dtype=str,
-            na_filter=True, low_memory=False,
-            on_bad_lines="skip"
-        )
+        return pd.read_csv(file_obj, sep="\t", dtype=str,
+                           na_filter=True, low_memory=False, on_bad_lines="skip")
 
 def _read_excel_any(file_obj):
     _rewind(file_obj)
@@ -271,9 +326,9 @@ def _read_any_table(file_obj):
         st.warning(f"Unsupported supplement file type: {file_obj.name}")
         return pd.DataFrame()
 
-# =================================
-# HELPERS — FREQUENCY LOGIC
-# =================================
+# =============================================================================
+# SECTION: Gene frequency helpers
+# =============================================================================
 def _standardize_cols(cols):
     return [str(c).strip().lower().replace(" ", "_") for c in cols]
 
@@ -285,7 +340,7 @@ def _find_col(cols, candidates):
     return None
 
 def infer_total_samples(named_frames, sample_cands=None) -> int:
-    """Infer denominator from any uploaded table that has a sample id column."""
+    """Infer unique sample count across all uploaded supplemental tables."""
     if sample_cands is None:
         sample_cands = [
             "tumor_sample_barcode", "sample_id", "sample", "biosample",
@@ -305,10 +360,10 @@ def infer_total_samples(named_frames, sample_cands=None) -> int:
 
 def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = None):
     """
-    df can be:
-      A) long format: (gene, sample_id)
-      B) aggregated:  (gene, count)
-    Returns (freq_df, denominator_used)
+    Accept either long format: (gene, sample_id)
+            or aggregated:     (gene, count)
+    Return frequency per gene with denominator set to either provided total_samples
+    or unique sample count derived from input.
     """
     if df is None or df.empty:
         return pd.DataFrame(columns=["gene", "n_samples", "percentage"]), 0
@@ -326,6 +381,7 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
     if not gene_col:
         raise ValueError("Could not detect a gene column (e.g., 'gene', 'symbol', 'Hugo_Symbol').")
 
+    # Long format: gene + sample_id -> unique sample count per gene
     if sample_col and (count_col is None or count_col not in df.columns):
         sub = df[[gene_col, sample_col]].dropna()
         if sub.empty:
@@ -335,6 +391,7 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
         grp = sub.groupby(gene_col)[sample_col].nunique().reset_index(name="n_samples")
         denom = int(total_samples) if total_samples else int(sub[sample_col].nunique())
 
+    # Aggregated: gene + count
     elif count_col in df.columns:
         sub = df[[gene_col, count_col]].dropna()
         if sub.empty:
@@ -358,62 +415,103 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
         grp = grp.rename(columns={grp.columns[0]: "gene"})
     return grp, denom
 
-# =================================
-# BUILD / LOAD INDEX (Chroma)
-# =================================
-def build_index(docs: List[Document]) -> Tuple[Chroma, OpenAIEmbeddings, List[Document]]:
+# =============================================================================
+# SECTION: Index builders (Chroma new client API + FAISS fallback)
+# =============================================================================
+def _split_docs(docs: List[Document]):
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     splits = splitter.split_documents(docs)
     if len(splits) == 0:
         raise ValueError("No text extracted from the uploaded files.")
-    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-    vectorstore = Chroma.from_documents(splits, embeddings, persist_directory=PERSIST_DIR)
-    try:
-        vectorstore.persist()
-    except Exception:
-        pass
-    return vectorstore, embeddings, splits
+    return splits
 
-def load_existing_index() -> Tuple[Chroma, OpenAIEmbeddings]:
+def build_index(docs: List[Document]):
+    """
+    Try Chroma (persistent). If the Chroma client/vectorstore cannot be created
+    (e.g., due to sqlite version or missing chroma), fall back to FAISS in-memory.
+    """
+    splits = _split_docs(docs)
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-    vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
-    return vs, embeddings
 
-# =================================
-# PROMPTS
-# =================================
+    # Attempt Chroma first (requires both Chroma class and a working PersistentClient)
+    if Chroma is not None and CLIENT is not None:
+        try:
+            vs = Chroma.from_documents(
+                splits,
+                embeddings,
+                client=CLIENT,                # New API: pass the PersistentClient
+                collection_name=COLLECTION,
+            )
+            try:
+                vs.persist()  # safe-guarded (may be a no-op with some builds)
+            except Exception:
+                pass
+            backend = "chroma"
+            return vs, embeddings, splits, backend
+        except Exception as e:
+            st.sidebar.error(f"Chroma init failed; falling back to FAISS: {e}")
+
+    # FAISS: fast, reliable, in-memory (no persistence)
+    vs = FAISS.from_documents(splits, embeddings)
+    backend = "faiss"
+    return vs, embeddings, splits, backend
+
+def load_existing_index():
+    """
+    Load an existing Chroma collection if available; FAISS has no persistence
+    so we create a new embedding function and return None for the vectorstore.
+    """
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+    if Chroma is not None and CLIENT is not None:
+        try:
+            vs = Chroma(
+                client=CLIENT,
+                collection_name=COLLECTION,
+                embedding_function=embeddings,
+            )
+            return vs, embeddings, "chroma"
+        except Exception as e:
+            st.sidebar.error(f"Chroma load failed; new ingestion needed: {e}")
+
+    # No persisted FAISS — user must (re)ingest
+    return None, embeddings, "faiss"
+
+# =============================================================================
+# SECTION: Prompt templates
+# =============================================================================
 SUMMARY_SYSTEM = (
-    "You are a meticulous scientific analyst. I am a bioinformatics software engineer. "
-    "Generate a clear, concise, and strictly factual summary of the provided content. "
-    "Do not speculate or add external knowledge. "
-    "If the content includes tables, highlight the most important columns and notable values. "
-    "If figures are present, briefly describe the key features or findings they illustrate. "
-    "Keep the summary precise, structured, and directly grounded in the source material."
+    "You are a meticulous scientific analyst. Generate a clear, concise, and strictly factual summary of the provided "
+    "content. Do not speculate or add external knowledge. If tables exist, highlight the most important columns and "
+    "notable values. If figures are present, briefly describe key features they illustrate. Keep the summary grounded."
 )
 SUMMARY_USER = "Summarize the following corpus in <= 20 bullet points. If multiple files are present, group by source name.\n\n{context}"
 summary_prompt = ChatPromptTemplate.from_messages([("system", SUMMARY_SYSTEM), ("human", SUMMARY_USER)])
 
 QA_SYSTEM = (
-    "You are a bioinformatics software engineer. You answer questions ONLY using the given context. "
+    "You are a bioinformatics software engineer. Answer ONLY using the given context. "
     "If the answer isn't in the context, say 'I don't know from the provided files.' "
     "Provide brief citations like (source, optional sheet/page)."
 )
 QA_USER = "Question: {question}\n\nUse the context to answer concisely in 1-15 sentences.\n\nContext:\n{context}"
 qa_prompt = ChatPromptTemplate.from_messages([("system", QA_SYSTEM), ("human", QA_USER)])
 
-# =================================
-# SESSION STATE
-# =================================
+# =============================================================================
+# SECTION: Streamlit session state
+# =============================================================================
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
 if "all_docs" not in st.session_state:
     st.session_state.all_docs = []
 if "all_figs" not in st.session_state:
     st.session_state.all_figs = []
+if "supp_named_frames" not in st.session_state:
+    st.session_state.supp_named_frames = []
+if "backend" not in st.session_state:
+    st.session_state.backend = None
 
-# =================================
-# SIDEBAR
-# =================================
+# =============================================================================
+# SECTION: Sidebar (uploads & actions)
+# =============================================================================
 with st.sidebar:
     st.subheader("Upload files")
     uploads = st.file_uploader(
@@ -425,11 +523,11 @@ with st.sidebar:
     with colb1:
         build_btn = st.button("Ingest Files", type="primary")
     with colb2:
-        load_btn = st.button("Ingest Existing Files")
+        load_btn = st.button("Load Existing Index")
 
-# =================================
-# INDEX ACTIONS
-# =================================
+# =============================================================================
+# SECTION: Index actions
+# =============================================================================
 if build_btn:
     if not uploads:
         st.warning("Please upload at least one file.")
@@ -440,26 +538,31 @@ if build_btn:
                 st.error("No parsable content found in the uploaded files.")
             else:
                 try:
-                    vs, _, splits = build_index(docs)
+                    vs, _, splits, backend = build_index(docs)
                     st.session_state.vectorstore = vs
                     st.session_state.all_docs = splits
                     st.session_state.all_figs = figs
-                    st.success(f"Indexed {len(splits)} chunks. Figures detected: {len(figs)}. Saved to {PERSIST_DIR}")
+                    st.session_state.backend = backend
+                    st.success(f"Indexed {len(splits)} chunks with backend: {backend.upper()}. Figures: {len(figs)}.")
                 except Exception as e:
                     st.exception(e)
 
 if load_btn:
-    with st.spinner("Loading existing Chroma index…"):
+    with st.spinner("Loading existing index…"):
         try:
-            vs, _ = load_existing_index()
-            st.session_state.vectorstore = vs
-            st.info(f"Loaded existing index from {PERSIST_DIR}.")
+            vs, _, backend = load_existing_index()
+            if vs is not None:
+                st.session_state.vectorstore = vs
+                st.session_state.backend = backend
+                st.info(f"Loaded existing collection with backend: {backend.upper()}.")
+            else:
+                st.warning("No persisted index found; please ingest files.")
         except Exception as e:
             st.exception(e)
 
-# =================================
-# TABS
-# =================================
+# =============================================================================
+# SECTION: Tabs (Summary, QA, Figures, Frequencies)
+# =============================================================================
 summary_tab, qa_tab, figs_tab, freq_tab = st.tabs(
     ["📝 Summary", "❓ Q&A", "🖼️ Figures", "📊 Gene Frequencies"]
 )
@@ -472,7 +575,7 @@ with summary_tab:
     else:
         if st.button("Generate Summary", key="summ_btn"):
             with st.spinner("Summarizing…"):
-                subset = list(st.session_state.all_docs)[:25]
+                subset = list(st.session_state.all_docs)[:25]  # small cap for faster demo
                 if not subset:
                     st.warning("No chunks available to summarize. Try rebuilding the index.")
                 else:
@@ -532,11 +635,11 @@ with figs_tab:
             with cols[i % 3]:
                 st.image(img, caption=f"Figure {i+1}", use_column_width=True)
 
-# ----- Gene Frequencies & Lookup -----
+# ----- Gene Frequencies -----
 with freq_tab:
     st.write("Upload **cBio-style tables** (mutations/CNA/SV/clinical). Then query gene frequencies below.")
 
-    # ---------- Upload only ----------
+    # Upload supplemental tables
     supps = st.file_uploader(
         "Upload supplementary tables (CSV/TSV/TXT/XLSX)",
         type=["csv", "tsv", "txt", "xlsx", "xls"],
@@ -556,11 +659,10 @@ with freq_tab:
         if named_frames:
             st.session_state["supp_named_frames"] = named_frames
 
-    # ---------- Gene lookup & frequency ----------
     st.markdown("---")
     st.subheader("🔎 Query Gene Frequency (mutations/CNA/SV) — multiple genes")
 
-    if "supp_named_frames" not in st.session_state:
+    if "supp_named_frames" not in st.session_state or not st.session_state["supp_named_frames"]:
         st.info("Upload files above, then enter genes here.")
     else:
         named_frames = st.session_state["supp_named_frames"]
@@ -581,15 +683,13 @@ with freq_tab:
         ]
 
         def _norm(df: pd.DataFrame) -> pd.DataFrame:
-            d = df.copy()
-            d.columns = _standardize_cols(d.columns)
-            return d
+            d = df.copy(); d.columns = _standardize_cols(d.columns); return d
 
         def _find_sample_col(cols):
             return _find_col(cols, SAMPLE_COL_CANDS)
 
         def compute_numerator_for_gene(gene_query: str):
-            """Return (numerator:int, per_file_counts:list[(file, counted)]) for one gene."""
+            """Count distinct samples per gene across all uploaded supplemental tables."""
             gene_upper = gene_query.strip().upper()
             numerator_samples = set()
             add_rows_without_ids = 0
@@ -608,7 +708,7 @@ with freq_tab:
 
                 file_added = 0
 
-                # Mutations/CNA (long) with Hugo_Symbol
+                # Mutation/CNA long tables
                 if hugo_col:
                     mask = (
                         df[hugo_col].astype(str).str.strip().str.upper() == gene_upper
@@ -623,7 +723,7 @@ with freq_tab:
                             numerator_samples |= ids
                             file_added = len(ids)
                         else:
-                            # Wide CNA matrix (one row per gene): count non-null sample columns
+                            # Wide tables w/out explicit sample IDs: approximate by non-null sample-like cols
                             non_id_cols = [c for c in sub.columns if c != hugo_col]
                             meta_like = {"entrez_gene_id", "chromosome", "cytoband"}
                             non_id_cols = [c for c in non_id_cols if c not in meta_like]
@@ -636,7 +736,7 @@ with freq_tab:
                                 add_rows_without_ids += cnt
                                 file_added = cnt
 
-                # Structural variants (SV) with Site1/2_Hugo_Symbol
+                # Structural variants
                 elif site1_col or site2_col:
                     m1 = df[site1_col].astype(str).str.strip().str.upper() == gene_upper if site1_col else False
                     m2 = df[site2_col].astype(str).str.strip().str.upper() == gene_upper if site2_col else False
@@ -658,7 +758,7 @@ with freq_tab:
             return int(numerator), per_file_counts
 
         if st.button("Compute Gene Frequency") and genes_input.strip():
-            # Parse comma-separated list, trim, dedupe preserving order
+            # Parse comma-separated genes, dedupe preserving order
             raw_list = [g.strip() for g in genes_input.split(",") if g.strip()]
             seen = set(); genes = []
             for g in raw_list:
@@ -671,7 +771,6 @@ with freq_tab:
             else:
                 results = []
                 per_gene_breakdown = {}
-
                 for g in genes:
                     num, breakdown = compute_numerator_for_gene(g)
                     per_gene_breakdown[g] = breakdown
