@@ -296,7 +296,7 @@ def _brief_palette_desc(colors):
     names=[_name(c) for c in colors[:5]]
     out=[]
     for n in names:
-        if not out or out[-1]!=n: out.append(n)
+        if not out or not out or out[-1]!=n: out.append(n)
     return ", ".join(out)
 
 def _type_hint(fig_type: str) -> str:
@@ -423,7 +423,7 @@ with figs_tab:
     else:
         for i,img in enumerate(figures, start=1):
             st.markdown(f"### Figure {i}")
-            st.image(img, use_container_width=True)
+            st.image(img, width='stretch')  # ⬅️ updated
             rep=analyze_image(img, lang=lang)
             c1,c2,c3=st.columns(3)
             with c1:
@@ -436,7 +436,7 @@ with figs_tab:
                     import numpy as np, PIL.Image as PILI
                     arr=np.zeros((30,50*len(cols),3), dtype=np.uint8)
                     for j,(r,g,b) in enumerate(cols): arr[:, j*50:(j+1)*50,:]=[r,g,b]
-                    st.image(PILI.fromarray(arr), use_container_width=True)
+                    st.image(PILI.fromarray(arr), width='stretch')  # ⬅️ updated
                 else:
                     st.write("(no palette)")
             with c3:
@@ -447,6 +447,11 @@ with figs_tab:
                 md=generate_interpretation_md(rep)
                 st.markdown(md)
                 ts=datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                st.download_button("⬇️ Download interpretation (Markdown)",
-                    data=md.encode("utf-8"), file_name=f"figure_{i}_interpretation_{ts}.md", mime="text/markdown", use_container_width=True)
+                st.download_button(
+                    "⬇️ Download interpretation (Markdown)",
+                    data=md.encode("utf-8"),
+                    file_name=f"figure_{i}_interpretation_{ts}.md",
+                    mime="text/markdown",
+                    width='stretch'  # ⬅️ updated
+                )
             st.markdown("---")
