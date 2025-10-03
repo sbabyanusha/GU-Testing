@@ -1,0 +1,6 @@
+[browser]
+gatherUsageStats = false
+
+[telemetry]
+# Some versions read this key too; safe to include.
+disable = true
