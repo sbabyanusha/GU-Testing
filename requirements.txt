@@ -12,3 +12,5 @@ pytesseract
 textract
 pysqlite3-binary>=0.5.2
 six>=1.16.0
+opencv-python-headless>=4.10.0
+scikit-image>=0.24.0
