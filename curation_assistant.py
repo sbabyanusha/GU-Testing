@@ -1,37 +1,29 @@
+from __future__ import annotations
 """
-Synopsis Tool
-
-- Summarize & Q&A strictly from uploaded files (.pdf, .txt, .doc/.docx, .xlsx)
-- Extract figures/images from PDFs, and add to the RAG index
-- Upload cBio-style tables (mutations/CNA/SV/clinical) and query gene frequencies
-- Query multiple genes (e.g., TP53, EGFR, KRAS) and compute % = (# profiled samples for gene / total profiled samples) * 100
+Synopsis Tool (All‑in‑One)
+--------------------------
+- Ingest PDFs/DOCX/TXT/CSV/XLSX into a lightweight local RAG index
+- Summarize and Q&A strictly from uploaded documents
+- Extract figures from PDFs, analyze uploaded pictures (OCR, sub-panels, chart guess, scale bar, colors, EXIF)
+- Compute per‑gene frequencies from cBio-style tables
 
 Quickstart
 ----------
-1) Python 3.9+  (3.10+ recommended)
-2) pip install -r requirements.txt
+1) Python 3.9+ (3.10+ recommended)
+2) pip install -r requirements.txt  # plus the extras listed below if needed
 3) export OPENAI_API_KEY=sk-...
 4) streamlit run new_app.py
-"""
-
-from __future__ import annotations
-"""
-Synopsis Tool
------------------------------
-- Ingest PDFs/DOCX/CSV/XLSX into a lightweight local RAG index
-- Summarize and Q&A strictly from uploaded documents
-- Extract figures from PDFs and optionally OCR them
-- Compute simple per-gene frequencies from cBio-style tables
 
 """
 
 # =============================================================================
 # SECTION: Compatibility shims (Python 3.13 sqlite, NumPy 2.x alias)
 # =============================================================================
-import sys
-# Provide a modern sqlite module for environments that ship an old stdlib sqlite
-# - Requires pysqlite3-binary in requirements. If import fails, we continue
-#   without persistence (FAISS fallback will still work).
+import sys, io, re, json, tempfile
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any
+
+# sqlite shim (optional)
 try:
     import pysqlite3  # type: ignore
     sys.modules["sqlite3"] = sys.modules["pysqlite3"]
@@ -39,7 +31,7 @@ try:
 except Exception:
     SQLITE_SHIM_OK = False
 
-# NumPy 2.x removes np.float_. Some upstream deps still reference it.
+# NumPy shim for 2.x float_
 try:
     import numpy as np  # type: ignore
     if not hasattr(np, "float_"):
@@ -49,86 +41,74 @@ except Exception:
     NP_SHIM_OK = False
 
 # =============================================================================
-# SECTION: Standard libs & third-party imports
+# SECTION: Streamlit & core libs
 # =============================================================================
-import io
-import re
-import tempfile
-from pathlib import Path
-from typing import List, Tuple, Optional
-
 import streamlit as st
 import pandas as pd
-from PIL import Image
+from PIL import Image, ExifTags
 
 # LangChain + vectorstores
-# Try new "langchain_chroma" first; fall back to community path if not installed.
 Chroma = None
 CLIENT = None
 chroma_source = None
 client_error = None
 
 try:
-    from langchain_chroma import Chroma as _Chroma  # Newer LC integration
+    from langchain_chroma import Chroma as _Chroma
     Chroma = _Chroma
     chroma_source = "langchain_chroma"
 except Exception:
     try:
-        from langchain_community.vectorstores import Chroma as _Chroma  # Legacy LC integration
+        from langchain_community.vectorstores import Chroma as _Chroma
         Chroma = _Chroma
         chroma_source = "langchain_community"
     except Exception:
         chroma_source = None
 
-# New Chroma Client API (migration-safe). If it fails, we can still run FAISS.
 try:
-    import chromadb  # noqa: F401
-    from chromadb import PersistentClient  # New API
+    import chromadb
+    from chromadb import PersistentClient
     CLIENT = PersistentClient(path="./chroma_index")
 except Exception as e:
     client_error = e
 
-# FAISS fallback (always available to avoid hard failure)
 from langchain_community.vectorstores import FAISS
-
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-
-# Readers
 from langchain_community.document_loaders import PyPDFLoader
 import docx  # python-docx
 import mammoth  # .docx fallback
 
 # =============================================================================
-# SECTION: Streamlit setup & constants
+# SECTION: Figure Analyzer deps
+# =============================================================================
+import cv2
+from skimage.util import img_as_ubyte
+from skimage.feature import canny
+from skimage.transform import hough_line, hough_line_peaks
+
+try:
+    import pytesseract
+    TESS_AVAILABLE = True
+except Exception:
+    TESS_AVAILABLE = False
+
+# =============================================================================
+# SECTION: UI Setup
 # =============================================================================
 st.set_page_config(page_title="🧬 Curation Assistant", layout="wide")
 
-# Tuning knobs
-CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 150
-TOP_K = 5
-MMR_LAMBDA = 0.5
-
-# Persistence & model params
-PERSIST_DIR = "./chroma_index"
-COLLECTION = "curation_assistant"
-EMBED_MODEL = "text-embedding-3-small"
-LLM_MODEL = "gpt-4o-mini"
-
-# UI Styles
+# UI styles
 st.markdown(
     """
 <style>
 .block-container{padding-top:1.5rem;}
-.hero {
-  background: linear-gradient(135deg,#6E8EF5 0%, #A777E3 50%, #F08BA9 100%);
-  color: white; padding: 18px 20px; border-radius: 16px; margin-bottom: 16px;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.15);
-}
+.hero {background: linear-gradient(135deg,#6E8EF5 0%, #A777E3 50%, #F08BA9 100%);
+       color: white; padding: 18px 20px; border-radius: 16px; margin-bottom: 16px;
+       box-shadow: 0 6px 24px rgba(0,0,0,0.15);} 
 .tag {background: rgba(255,255,255,0.18); padding: 2px 10px; border-radius: 999px; margin-left: 8px; font-size: 0.85rem;}
 .stExpander, .stTabs [data-baseweb="tab"] {border-radius: 12px;}
 .stButton>button {border-radius: 999px; padding: 0.5rem 1rem; font-weight: 600;}
@@ -150,48 +130,41 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Quick env hint
-if not st.session_state.get("OPENAI_KEY_WARNED") and not st.secrets.get("OPENAI_API_KEY", None) and not ("OPENAI_API_KEY" in st.session_state or "OPENAI_API_KEY" in st.session_state):
-    if not ("OPENAI_API_KEY" in st.session_state or "OPENAI_API_KEY" in st.secrets or "OPENAI_API_KEY" in st.session_state):
-        if not ("OPENAI_API_KEY" in st.session_state or "OPENAI_API_KEY" in st.secrets or "OPENAI_API_KEY" in st.session_state):
-            pass  # Avoid noisy warnings in some hosts
+# =============================================================================
+# SECTION: Constants & Session
+# =============================================================================
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+TOP_K = 5
+MMR_LAMBDA = 0.5
+PERSIST_DIR = "./chroma_index"
+COLLECTION = "curation_assistant"
+EMBED_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
 
-# =============================================================================
-# SECTION: Diagnostics (left sidebar)
-# =============================================================================
-#st.sidebar.markdown("### 🔧 Diagnostics")
-#st.sidebar.write({
-    #"python": sys.version,
-    #"SQLITE_SHIM_OK": SQLITE_SHIM_OK,
-    #"NP_SHIM_OK": NP_SHIM_OK,
-    #"Chroma_imported": bool(Chroma),
-    #"chroma_source": chroma_source,
-    #"chromadb_client_ok": CLIENT is not None,
-    #"chromadb_client_error": repr(client_error) if client_error else None,
-#})
+for key, default in [
+    ("vectorstore", None), ("all_docs", []), ("all_figs", []), ("supp_named_frames", []), ("backend", None)
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # =============================================================================
 # SECTION: File readers & utilities
 # =============================================================================
 def _read_txt(file: io.BytesIO, name: str) -> List[Document]:
-    """Read plain text-like inputs (txt/md/csv treated as text)."""
     text = file.read().decode("utf-8", errors="ignore")
     return [Document(page_content=text, metadata={"source": name})]
 
+
 def _read_pdf_to_docs(tmp_path: Path, name: str) -> List[Document]:
-    """Load a PDF as LangChain Documents (page-wise)."""
     loader = PyPDFLoader(str(tmp_path))
     docs = loader.load()
     for d in docs:
         d.metadata = {**d.metadata, "source": name}
     return docs
 
+
 def _extract_pdf_images(tmp_path: Path, name: str) -> Tuple[List[Document], List[Image.Image]]:
-    """
-    Extract embedded images from PDF pages.
-    - OCR image regions if pytesseract is available
-    - Return both OCR text (as docs) and PIL images for display
-    """
     from pypdf import PdfReader
     pil_images: List[Image.Image] = []
     ocr_docs: List[Document] = []
@@ -208,15 +181,12 @@ def _extract_pdf_images(tmp_path: Path, name: str) -> Tuple[List[Document], List
                     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                     pil_images.append(img)
                     ocr_text = ""
-                    if "pytesseract" in sys.modules:
-                        import pytesseract  # lazy import
+                    if TESS_AVAILABLE:
                         try:
                             ocr_text = pytesseract.image_to_string(img)
                         except Exception:
                             ocr_text = ""
-                    caption_text = "\n".join(
-                        [ln for ln in page_text.splitlines() if re.match(r"\s*Fig(ure)?\b", ln, re.I)]
-                    )
+                    caption_text = "\n".join([ln for ln in page_text.splitlines() if re.match(r"\s*Fig(ure)?\\b", ln, re.I)])
                     combined = "\n".join([s for s in [caption_text.strip(), ocr_text.strip()] if s])
                     if combined:
                         ocr_docs.append(
@@ -231,12 +201,12 @@ def _extract_pdf_images(tmp_path: Path, name: str) -> Tuple[List[Document], List
         pass
     return ocr_docs, pil_images
 
+
 def _read_docx(file: io.BytesIO, name: str) -> List[Document]:
-    """Read .docx via python-docx; fallback to mammoth raw text."""
     try:
         f = io.BytesIO(file.read())
-        doc = docx.Document(f)
-        paragraphs = [p.text for p in doc.paragraphs]
+        d = docx.Document(f)
+        paragraphs = [p.text for p in d.paragraphs]
         text = "\n".join([p for p in paragraphs if p and p.strip()])
         return [Document(page_content=text, metadata={"source": name})]
     except Exception:
@@ -245,8 +215,8 @@ def _read_docx(file: io.BytesIO, name: str) -> List[Document]:
         text = result.value or ""
         return [Document(page_content=text, metadata={"source": name})]
 
+
 def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
-    """Flatten Excel sheets into tab-delimited text documents."""
     docs: List[Document] = []
     try:
         xl = pd.ExcelFile(file)
@@ -260,8 +230,8 @@ def _read_xlsx(file: io.BytesIO, name: str) -> List[Document]:
         st.error(f"Failed to parse Excel '{name}': {e}")
         return []
 
+
 def load_files_to_documents(uploaded_files) -> Tuple[List[Document], List[Image.Image]]:
-    """Route files by extension and collect both text docs and figures."""
     all_docs: List[Document] = []
     all_figs: List[Image.Image] = []
     for uf in uploaded_files:
@@ -285,9 +255,11 @@ def load_files_to_documents(uploaded_files) -> Tuple[List[Document], List[Image.
 # =============================================================================
 # SECTION: Robust table readers (for gene frequency tab)
 # =============================================================================
+
 def _rewind(file_obj):
     try: file_obj.seek(0)
     except Exception: pass
+
 
 def _read_csv_any(file_obj):
     _rewind(file_obj)
@@ -299,6 +271,7 @@ def _read_csv_any(file_obj):
         return pd.read_csv(file_obj, sep="\t", dtype=str,
                            na_filter=True, low_memory=False, on_bad_lines="skip")
 
+
 def _read_excel_any(file_obj):
     _rewind(file_obj)
     try:
@@ -309,6 +282,7 @@ def _read_excel_any(file_obj):
     except Exception as e:
         st.error(f"Excel read failed: {e}")
         return pd.DataFrame()
+
 
 def _read_any_table(file_obj):
     suffix = Path(file_obj.name).suffix.lower()
@@ -323,8 +297,10 @@ def _read_any_table(file_obj):
 # =============================================================================
 # SECTION: Gene frequency helpers
 # =============================================================================
+
 def _standardize_cols(cols):
     return [str(c).strip().lower().replace(" ", "_") for c in cols]
+
 
 def _find_col(cols, candidates):
     for c in cols:
@@ -333,8 +309,8 @@ def _find_col(cols, candidates):
                 return c
     return None
 
+
 def infer_total_samples(named_frames, sample_cands=None) -> int:
-    """Infer unique sample count across all uploaded supplemental tables."""
     if sample_cands is None:
         sample_cands = [
             "tumor_sample_barcode", "sample_id", "sample", "biosample",
@@ -352,13 +328,8 @@ def infer_total_samples(named_frames, sample_cands=None) -> int:
             uniq.update(vals.tolist())
     return len(uniq)
 
+
 def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = None):
-    """
-    Accept either long format: (gene, sample_id)
-            or aggregated:     (gene, count)
-    Return frequency per gene with denominator set to either provided total_samples
-    or unique sample count derived from input.
-    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["gene", "n_samples", "percentage"]), 0
 
@@ -375,7 +346,6 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
     if not gene_col:
         raise ValueError("Could not detect a gene column (e.g., 'gene', 'symbol', 'Hugo_Symbol').")
 
-    # Long format: gene + sample_id -> unique sample count per gene
     if sample_col and (count_col is None or count_col not in df.columns):
         sub = df[[gene_col, sample_col]].dropna()
         if sub.empty:
@@ -384,8 +354,6 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
         sub[sample_col] = sub[sample_col].astype(str)
         grp = sub.groupby(gene_col)[sample_col].nunique().reset_index(name="n_samples")
         denom = int(total_samples) if total_samples else int(sub[sample_col].nunique())
-
-    # Aggregated: gene + count
     elif count_col in df.columns:
         sub = df[[gene_col, count_col]].dropna()
         if sub.empty:
@@ -394,7 +362,6 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
         sub[count_col] = pd.to_numeric(sub[count_col], errors="coerce").fillna(0).astype(int)
         grp = sub.groupby(gene_col)[count_col].sum().reset_index(name="n_samples")
         denom = int(total_samples) if total_samples else int(grp["n_samples"].sum())
-
     else:
         raise ValueError(
             "Could not detect suitable columns. Expected either (gene + sample_id) or (gene + count). "
@@ -410,8 +377,9 @@ def compute_gene_frequencies(df: pd.DataFrame, total_samples: Optional[int] = No
     return grp, denom
 
 # =============================================================================
-# SECTION: Index builders (Chroma new client API + FAISS fallback)
+# SECTION: Index builders (Chroma + FAISS fallback)
 # =============================================================================
+
 def _split_docs(docs: List[Document]):
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     splits = splitter.split_documents(docs)
@@ -419,64 +387,46 @@ def _split_docs(docs: List[Document]):
         raise ValueError("No text extracted from the uploaded files.")
     return splits
 
+
 def build_index(docs: List[Document]):
-    """
-    Try Chroma (persistent). If the Chroma client/vectorstore cannot be created
-    (e.g., due to sqlite version or missing chroma), fall back to FAISS in-memory.
-    """
     splits = _split_docs(docs)
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-
-    # Attempt Chroma first (requires both Chroma class and a working PersistentClient)
     if Chroma is not None and CLIENT is not None:
         try:
             vs = Chroma.from_documents(
                 splits,
                 embeddings,
-                client=CLIENT,                # New API: pass the PersistentClient
+                client=CLIENT,
                 collection_name=COLLECTION,
             )
             try:
-                vs.persist()  # safe-guarded (may be a no-op with some builds)
+                vs.persist()
             except Exception:
                 pass
-            backend = "chroma"
-            return vs, embeddings, splits, backend
+            return vs, embeddings, splits, "chroma"
         except Exception as e:
             st.sidebar.error(f"Chroma init failed; falling back to FAISS: {e}")
-
-    # FAISS: fast, reliable, in-memory (no persistence)
     vs = FAISS.from_documents(splits, embeddings)
-    backend = "faiss"
-    return vs, embeddings, splits, backend
+    return vs, embeddings, splits, "faiss"
+
 
 def load_existing_index():
-    """
-    Load an existing Chroma collection if available; FAISS has no persistence
-    so we create a new embedding function and return None for the vectorstore.
-    """
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
     if Chroma is not None and CLIENT is not None:
         try:
-            vs = Chroma(
-                client=CLIENT,
-                collection_name=COLLECTION,
-                embedding_function=embeddings,
-            )
+            vs = Chroma(client=CLIENT, collection_name=COLLECTION, embedding_function=embeddings)
             return vs, embeddings, "chroma"
         except Exception as e:
             st.sidebar.error(f"Chroma load failed; new ingestion needed: {e}")
-
-    # No persisted FAISS — user must (re)ingest
     return None, embeddings, "faiss"
 
 # =============================================================================
-# SECTION: Prompt templates
+# SECTION: Prompts
 # =============================================================================
 SUMMARY_SYSTEM = (
     "You are a meticulous scientific analyst. Generate a clear, concise, and strictly factual summary of the provided "
-    "content. Do not speculate or add external knowledge. If tables exist, highlight the most important columns and "
-    "notable values. If figures are present, briefly describe key features they illustrate. Keep the summary grounded."
+    "content. Do not speculate or add external knowledge. If tables exist, highlight important columns and notable values. "
+    "If figures are present, briefly describe key features they illustrate."
 )
 SUMMARY_USER = "Summarize the following corpus in <= 20 bullet points. If multiple files are present, group by source name.\n\n{context}"
 summary_prompt = ChatPromptTemplate.from_messages([("system", SUMMARY_SYSTEM), ("human", SUMMARY_USER)])
@@ -490,18 +440,185 @@ QA_USER = "Question: {question}\n\nUse the context to answer concisely in 1-15 s
 qa_prompt = ChatPromptTemplate.from_messages([("system", QA_SYSTEM), ("human", QA_USER)])
 
 # =============================================================================
-# SECTION: Streamlit session state
+# SECTION: FIGURE ANALYZER (built-in)
 # =============================================================================
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-if "all_docs" not in st.session_state:
-    st.session_state.all_docs = []
-if "all_figs" not in st.session_state:
-    st.session_state.all_figs = []
-if "supp_named_frames" not in st.session_state:
-    st.session_state.supp_named_frames = []
-if "backend" not in st.session_state:
-    st.session_state.backend = None
+
+def to_cv(img: Image.Image) -> np.ndarray:
+    arr = np.array(img.convert("RGB"))
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def to_pil(cv_img: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+
+
+def read_exif(img: Image.Image) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    try:
+        exif = img.getexif()
+        if exif:
+            for tag_id, value in exif.items():
+                tag = ExifTags.TAGS.get(tag_id, tag_id)
+                meta[str(tag)] = str(value)
+    except Exception:
+        pass
+    return meta
+
+
+def ocr_image(img: Image.Image, lang: str = "eng") -> str:
+    if not TESS_AVAILABLE:
+        return ""
+    try:
+        return pytesseract.image_to_string(img, lang=lang).strip()
+    except Exception:
+        return ""
+
+
+def detect_subpanels(cv_bgr: np.ndarray):
+    gray = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = gray.shape[:2]
+    area_img = W*H
+    boxes = []
+    for cnt in contours:
+        x,y,w,h = cv2.boundingRect(cnt)
+        area = w*h
+        aspect = w/(h+1e-6)
+        if area > 0.02*area_img and 0.2 < aspect < 5 and w>60 and h>60:
+            boxes.append((x,y,w,h))
+    # remove nested
+    filtered = []
+    for b in boxes:
+        x,y,w,h = b
+        keep = True
+        for b2 in boxes:
+            if b is b2: continue
+            x2,y2,w2,h2 = b2
+            if x>=x2 and y>=y2 and x+w<=x2+w2 and y+h<=y2+h2 and (w*h) < (w2*h2):
+                keep = False; break
+        if keep: filtered.append(b)
+    filtered.sort(key=lambda r: (r[1]//50, r[0]))
+    return filtered[:12]
+
+
+def _axes_stats(gray_u8: np.ndarray) -> Dict[str, int]:
+    edges = canny(gray_u8/255.0, sigma=1.5)
+    h, theta, d = hough_line(edges)
+    _, angles, _ = hough_line_peaks(h, theta, d, num_peaks=15)
+    vert = sum(1 for a in angles if abs(np.degrees(a)) < 10 or abs(np.degrees(a)-180) < 10)
+    horiz = sum(1 for a in angles if abs(abs(np.degrees(a))-90) < 10)
+    return {"num_lines": int(len(angles)), "vertical": int(vert), "horizontal": int(horiz)}
+
+
+def infer_chart_type(gray_u8: np.ndarray) -> str:
+    ax = _axes_stats(gray_u8)
+    if ax["horizontal"] >= 1 and ax["vertical"] >= 1:
+        edge_density = float(np.mean(canny(gray_u8/255.0)))
+        return "line/scatter (axes detected)" if edge_density > 0.08 else "bar-like (axes detected)"
+    if ax["num_lines"] >= 6:
+        return "grid/heatmap-like (many straight lines)"
+    return "illustration/microscopy/other"
+
+
+def detect_scale_bar(cv_bgr: np.ndarray, ocr_text: str) -> bool:
+    gray = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2GRAY)
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY_INV, 21, 10)
+    contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = gray.shape[:2]
+    for cnt in contours:
+        x,y,w,h = cv2.boundingRect(cnt)
+        aspect = w/(h+1e-6)
+        area = w*h
+        if area > 0.001*W*H and (aspect > 8 or (1/aspect) > 8):
+            if y > 0.7*H or x > 0.7*W or x < 0.1*W:
+                return True
+    low = (ocr_text or "").lower()
+    for kw in ["scale", "µm", "um", "nm", "mm bar", "100 µm", "50 µm"]:
+        if kw in low: return True
+    return False
+
+
+def dominant_colors(cv_bgr: np.ndarray, k=5):
+    data = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2RGB).reshape(-1,3).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(data, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    centers = centers.astype(int)
+    counts = np.bincount(labels.flatten())
+    order = np.argsort(-counts)
+    return [tuple(map(int, centers[i])) for i in order]
+
+
+class PanelReport(dict):
+    def __init__(self, bbox, detected_chart, ocr_excerpt):
+        super().__init__(bbox=bbox, detected_chart=detected_chart, ocr_excerpt=ocr_excerpt)
+
+
+class FigureReport(dict):
+    def __init__(self, width, height, ocr_text, chart_guess, has_scale_bar, dominant_colors_list, panels, exif):
+        super().__init__(
+            width=width,
+            height=height,
+            ocr_text=ocr_text,
+            chart_guess=chart_guess,
+            has_scale_bar=has_scale_bar,
+            dominant_colors=dominant_colors_list,
+            panels=panels,
+            exif=exif,
+        )
+
+
+def analyze_image(img: Image.Image, lang: str = "eng") -> FigureReport:
+    cv_img = to_cv(img)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    gray_u8 = img_as_ubyte(gray/255.0)
+
+    text = ocr_image(img, lang=lang)
+    chart = infer_chart_type(gray_u8)
+
+    boxes = detect_subpanels(cv_img)
+    panels = []
+    for (x,y,w,h) in boxes:
+        crop = cv_img[y:y+h, x:x+w]
+        cg = infer_chart_type(img_as_ubyte(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)/255.0))
+        excerpt = ocr_image(to_pil(crop), lang=lang)[:300]
+        panels.append(PanelReport((x,y,w,h), cg, excerpt))
+
+    has_scale = detect_scale_bar(cv_img, text)
+    palette = dominant_colors(cv_img, k=5)
+    meta = read_exif(img)
+
+    return FigureReport(
+        width=img.width,
+        height=img.height,
+        ocr_text=text,
+        chart_guess=chart,
+        has_scale_bar=has_scale,
+        dominant_colors_list=palette,
+        panels=panels,
+        exif=meta,
+    )
+
+
+def draw_boxes(cv_bgr: np.ndarray, boxes):
+    out = cv_bgr.copy()
+    for i,(x,y,w,h) in enumerate(boxes):
+        cv2.rectangle(out, (x,y), (x+w,y+h), (36,255,12), 2)
+        cv2.putText(out, f"{chr(65 + (i%26))}", (x+5, y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36,255,12), 2)
+    return out
+
+
+def palette_image(colors):
+    if not colors:
+        return Image.new("RGB", (1,1), (255,255,255))
+    w = 50*len(colors); h=30
+    img = Image.new("RGB", (w,h), (255,255,255))
+    arr = np.array(img)
+    for i,(r,g,b) in enumerate(colors):
+        arr[:, i*50:(i+1)*50, :] = (int(r), int(g), int(b))
+    return Image.fromarray(arr)
 
 # =============================================================================
 # SECTION: Sidebar (uploads & actions)
@@ -557,9 +674,9 @@ if load_btn:
 # =============================================================================
 # SECTION: Tabs (Summary, QA, Figures, Frequencies)
 # =============================================================================
-summary_tab, qa_tab, figs_tab, freq_tab = st.tabs(
-    ["📝 Summary", "❓ Q&A", "🖼️ Figures", "📊 Gene Frequencies"]
-)
+summary_tab, qa_tab, figs_tab, freq_tab = st.tabs([
+    "📝 Summary", "❓ Q&A", "🖼️ Figures", "📊 Gene Frequencies"
+])
 
 # ----- Summary -----
 with summary_tab:
@@ -569,7 +686,7 @@ with summary_tab:
     else:
         if st.button("Generate Summary", key="summ_btn"):
             with st.spinner("Summarizing…"):
-                subset = list(st.session_state.all_docs)[:25]  # small cap for faster demo
+                subset = list(st.session_state.all_docs)[:25]
                 if not subset:
                     st.warning("No chunks available to summarize. Try rebuilding the index.")
                 else:
@@ -592,8 +709,7 @@ with qa_tab:
         if st.button("Ask", type="primary") and q.strip():
             with st.spinner("Retrieving evidence & answering…"):
                 retriever = st.session_state.vectorstore.as_retriever(
-                    search_type="mmr",
-                    search_kwargs={"k": TOP_K, "lambda_mult": MMR_LAMBDA},
+                    search_type="mmr", search_kwargs={"k": TOP_K, "lambda_mult": MMR_LAMBDA}
                 )
                 docs = retriever.get_relevant_documents(q)
                 if not docs:
@@ -617,28 +733,79 @@ with qa_tab:
                         with st.expander(f"{i}. {src} — sheet: {sheet or '-'} — page: {page or '-'}"):
                             st.code(d.page_content[:2000])
 
-# ----- Figures -----
+# ----- Figures (Analyzer) -----
 with figs_tab:
-    st.write("Extracted figures from PDFs (OCR text included in the index when available).")
-    figs = st.session_state.all_figs
-    if not figs:
-        st.info("No figures extracted yet — upload PDFs and rebuild the index.")
+    st.write("Extracted figures from PDFs (and you can also upload standalone images below).")
+    lang = st.text_input("OCR language (e.g., 'eng')", value="eng", key="fig_lang")
+    local_imgs = st.file_uploader(
+        "Optional: Upload additional figure images (PNG/JPG/TIFF)",
+        type=["png","jpg","jpeg","tif","tiff"], accept_multiple_files=True, key="fig_add_upl",
+    )
+
+    figures = list(st.session_state.all_figs)
+    if local_imgs:
+        for f in local_imgs:
+            try:
+                figures.append(Image.open(f).convert("RGB"))
+            except Exception:
+                st.warning(f"Could not open {f.name}")
+
+    if not figures:
+        st.info("No figures yet — upload PDFs and click *Ingest Files*, or add image files above.")
     else:
-        cols = st.columns(3)
-        for i, img in enumerate(figs):
-            with cols[i % 3]:
-                st.image(img, caption=f"Figure {i+1}", use_column_width=True)
+        all_reports: List[Dict[str, Any]] = []
+        for i, img in enumerate(figures, start=1):
+            st.markdown(f"### Figure {i}")
+            col1, col2 = st.columns([2,3])
+
+            with col1:
+                st.image(img, caption="Original", use_column_width=True)
+
+            rep = analyze_image(img, lang=lang)
+            all_reports.append(rep)
+            boxes = [p["bbox"] for p in rep["panels"]]
+            overlay = draw_boxes(to_cv(img), boxes) if boxes else to_cv(img)
+
+            with col2:
+                st.image(to_pil(overlay), caption="Detected subpanels (A, B, C…)" , use_column_width=True)
+
+            k1,k2,k3 = st.columns(3)
+            with k1:
+                st.subheader("Chart guess"); st.write(rep["chart_guess"]) 
+                st.subheader("Scale bar");  st.write("Yes" if rep["has_scale_bar"] else "No")
+            with k2:
+                st.subheader("Top colors")
+                st.image(palette_image(rep["dominant_colors"]))
+            with k3:
+                st.subheader("EXIF / Metadata")
+                st.json(rep["exif"] or {"note": "no EXIF"})
+
+            with st.expander("OCR (full image)"):
+                st.code(rep["ocr_text"] or "(no OCR text)")
+
+            if rep["panels"]:
+                with st.expander("Panels"):
+                    for idx, p in enumerate(rep["panels"]):
+                        st.markdown(f"**Panel {chr(65 + (idx % 26))}** — bbox: {p['bbox']}")
+                        st.write(f"Chart guess: {p['detected_chart']}")
+                        if p.get("ocr_excerpt"):
+                            st.code(p["ocr_excerpt"])
+
+            st.markdown("---")
+
+        buf = io.BytesIO(json.dumps(all_reports, indent=2).encode("utf-8"))
+        st.download_button(
+            "📥 Download figures analysis (JSON)", data=buf, file_name="figure_analysis.json", mime="application/json",
+            use_container_width=True
+        )
 
 # ----- Gene Frequencies -----
 with freq_tab:
     st.write("Upload **cBio-style tables** (mutations/CNA/SV/clinical). Then query gene frequencies below.")
 
-    # Upload supplemental tables
     supps = st.file_uploader(
         "Upload supplementary tables (CSV/TSV/TXT/XLSX)",
-        type=["csv", "tsv", "txt", "xlsx", "xls"],
-        accept_multiple_files=True,
-        key="supp_upload",
+        type=["csv", "tsv", "txt", "xlsx", "xls"], accept_multiple_files=True, key="supp_upload",
     )
 
     named_frames = []
@@ -656,7 +823,7 @@ with freq_tab:
     st.markdown("---")
     st.subheader("🔎 Query Gene Frequency (mutations/CNA/SV) — multiple genes")
 
-    if "supp_named_frames" not in st.session_state or not st.session_state["supp_named_frames"]:
+    if not st.session_state.get("supp_named_frames"):
         st.info("Upload files above, then enter genes here.")
     else:
         named_frames = st.session_state["supp_named_frames"]
@@ -683,7 +850,6 @@ with freq_tab:
             return _find_col(cols, SAMPLE_COL_CANDS)
 
         def compute_numerator_for_gene(gene_query: str):
-            """Count distinct samples per gene across all uploaded supplemental tables."""
             gene_upper = gene_query.strip().upper()
             numerator_samples = set()
             add_rows_without_ids = 0
@@ -694,20 +860,16 @@ with freq_tab:
                     continue
                 df = _norm(raw_df)
                 cols = list(df.columns)
-
                 hugo_col = _find_col(cols, ["hugo_symbol"])
                 site1_col = _find_col(cols, ["site1_hugo_symbol"])
                 site2_col = _find_col(cols, ["site2_hugo_symbol"])
                 sample_col = _find_sample_col(cols)
-
                 file_added = 0
 
-                # Mutation/CNA long tables
                 if hugo_col:
                     mask = (
                         df[hugo_col].astype(str).str.strip().str.upper() == gene_upper
-                        if use_case_insensitive else
-                        df[hugo_col].astype(str) == gene_query
+                        if use_case_insensitive else df[hugo_col].astype(str) == gene_query
                     )
                     sub = df.loc[mask]
                     if not sub.empty:
@@ -717,7 +879,6 @@ with freq_tab:
                             numerator_samples |= ids
                             file_added = len(ids)
                         else:
-                            # Wide tables w/out explicit sample IDs: approximate by non-null sample-like cols
                             non_id_cols = [c for c in sub.columns if c != hugo_col]
                             meta_like = {"entrez_gene_id", "chromosome", "cytoband"}
                             non_id_cols = [c for c in non_id_cols if c not in meta_like]
@@ -729,8 +890,6 @@ with freq_tab:
                                 cnt = int(len(sub))
                                 add_rows_without_ids += cnt
                                 file_added = cnt
-
-                # Structural variants
                 elif site1_col or site2_col:
                     m1 = df[site1_col].astype(str).str.strip().str.upper() == gene_upper if site1_col else False
                     m2 = df[site2_col].astype(str).str.strip().str.upper() == gene_upper if site2_col else False
@@ -752,7 +911,6 @@ with freq_tab:
             return int(numerator), per_file_counts
 
         if st.button("Compute Gene Frequency") and genes_input.strip():
-            # Parse comma-separated genes, dedupe preserving order
             raw_list = [g.strip() for g in genes_input.split(",") if g.strip()]
             seen = set(); genes = []
             for g in raw_list:
